@@ -1,0 +1,1562 @@
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local TextService = game:GetService("TextService")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+
+if not RunService:IsClient() or Players.LocalPlayer == nil then
+	warn("Event Explorer must run from a LocalScript or Studio's Client Command Bar during an active Play session.")
+	return
+end
+
+export type RemoteMethod = "FireServer" | "InvokeServer" | "Fire" | "Invoke"
+
+export type RemoteCall = {
+	expression: string,
+	method: RemoteMethod,
+}
+
+export type CacheEntry = {
+	source: string,
+	calls: { RemoteCall },
+}
+
+export type ScriptItem = {
+	object: LocalScript | ModuleScript,
+	cache: CacheEntry,
+	frame: Frame,
+	button: TextButton,
+	label: TextLabel,
+	indicators: Frame,
+	connections: { RBXScriptConnection },
+	nameLower: string,
+	pathLower: string,
+	order: number,
+	discoveryOrder: number,
+	selected: boolean,
+
+}
+
+type StringMap = { [string]: string }
+type PropertyMap = { [string]: any }
+type Ui = {
+	gui: ScreenGui,
+	window: Frame,
+	header: Frame,
+	body: Frame,
+	scriptPanel: Frame,
+	eventPanel: Frame,
+	logPanel: ScrollingFrame,
+	scriptList: ScrollingFrame,
+	eventList: ScrollingFrame,
+	eventOutput: TextBox,
+	logOutput: TextBox,
+	searchBox: TextBox,
+	actions: Frame,
+	tooltip: TextLabel,
+	resizeHandle: TextButton,
+	minimizeButton: TextButton,
+	closeButton: TextButton,
+}
+
+type DragState = {
+	start: Vector2,
+	position: UDim2,
+}
+
+type ResizeState = {
+	start: Vector2,
+	size: UDim2,
+}
+
+local CONFIG = table.freeze({
+	windowName = "RemoteEventAnalyzer",
+	defaultWidth = 700,
+	defaultHeight = 400,
+	minimumWidth = 400,
+	minimumHeight = 200,
+	headerHeight = 52,
+	scriptPanelWidth = 140,
+	logHeight = 336,
+	padding = 6,
+	background = Color3.fromRGB(24, 24, 24),
+	surface = Color3.fromRGB(18, 18, 18),
+	surfaceElevated = Color3.fromRGB(24, 24, 24),
+	surfaceHover = Color3.fromRGB(32, 32, 32),
+	border = Color3.fromRGB(40, 40, 40),
+	accent = Color3.fromRGB(0, 150, 255),
+	text = Color3.fromRGB(220, 220, 220),
+	mutedText = Color3.fromRGB(100, 100, 100),
+	selected = Color3.fromRGB(0, 100, 180),
+	selectedHover = Color3.fromRGB(0, 120, 200),
+	buttonCopy = Color3.fromRGB(130, 215, 130),
+	buttonCopyHover = Color3.fromRGB(160, 255, 160),
+	buttonClear = Color3.fromRGB(215, 100, 100),
+	buttonClearHover = Color3.fromRGB(255, 120, 120),
+	buttonRefresh = Color3.fromRGB(235, 185, 80),
+	buttonRefreshHover = Color3.fromRGB(255, 215, 100),
+	buttonExecute = Color3.fromRGB(165, 100, 225),
+	buttonExecuteHover = Color3.fromRGB(200, 130, 255),
+	buttonEdit = Color3.fromRGB(80, 200, 215),
+	buttonEditHover = Color3.fromRGB(110, 235, 255),
+	buttonGetScript = Color3.fromRGB(235, 140, 80),
+	buttonGetScriptHover = Color3.fromRGB(255, 175, 110),
+})
+
+local MethodColors: { [RemoteMethod]: Color3 } = {
+	FireServer = Color3.fromRGB(250, 210, 50),
+	InvokeServer = Color3.fromRGB(240, 100, 240),
+	Fire = Color3.fromRGB(50, 220, 110),
+	Invoke = Color3.fromRGB(255, 100, 100),
+}
+
+local RemoteMethods: { RemoteMethod } = { "FireServer", "InvokeServer", "Fire", "Invoke" }
+local FastTween = TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+local MediumTween = TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+local SlowTween = TweenInfo.new(0.5, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut)
+local EmptyOutput = "No remote event calls detected in this script."
+local NoSelectionOutput = "No script selected. Choose a script to view its event calls."
+
+local LocalPlayer = Players.LocalPlayer :: Player
+local ScriptCache: { [LocalScript | ModuleScript]: CacheEntry } = {}
+local ScriptItems: { ScriptItem } = {}
+local DuplicateSignatures: { [string]: boolean } = {}
+local ItemsByObject: { [LocalScript | ModuleScript]: ScriptItem } = {}
+local UiConnections: { RBXScriptConnection } = {}
+local WatchConnections: { RBXScriptConnection } = {}
+local ActiveTweens: { [Instance]: Tween } = {}
+local Ui: Ui? = nil
+local SelectedItem: ScriptItem? = nil
+local OrderCounter = 0
+local WindowSize = Vector2.new(CONFIG.defaultWidth, CONFIG.defaultHeight)
+local Minimized = false
+local Editing = false
+local Destroyed = false
+local DragState: DragState? = nil
+local ResizeState: ResizeState? = nil
+
+local function Trim(Value: string): string
+	return Value:match("^%s*(.-)%s*$") or ""
+end
+
+local function DisconnectAll(Connections: { RBXScriptConnection }): ()
+	for Index = #Connections, 1, -1 do
+		local Connection = Connections[Index]
+		Connections[Index] = nil :: any
+		Connection:Disconnect()
+	end
+end
+
+local function Track(Connections: { RBXScriptConnection }, Connection: RBXScriptConnection): RBXScriptConnection
+	table.insert(Connections, Connection)
+	return Connection
+end
+
+local function ExternalFunction(Name: string): ((...any) -> ...any)?
+	local Value = (getfenv() :: { [string]: any })[Name]
+	if type(Value) == "function" then
+		return Value
+	end
+	return nil
+end
+
+local function Tween(Instance: Instance, Info: TweenInfo, Properties: PropertyMap): Tween
+	local Previous = ActiveTweens[Instance]
+	if Previous then
+		Previous:Cancel()
+	end
+
+	local NextTween = TweenService:Create(Instance, Info, Properties)
+	ActiveTweens[Instance] = NextTween
+	NextTween.Completed:Once(function()
+		if ActiveTweens[Instance] == NextTween then
+			ActiveTweens[Instance] = nil
+		end
+	end)
+	NextTween:Play()
+	return NextTween
+end
+
+local function Create(ClassName: string, Properties: PropertyMap?): any
+	local Instance = Instance.new(ClassName)
+	if Properties then
+		for Property, Value in pairs(Properties) do
+			(Instance :: any)[Property] = Value
+		end
+	end
+	return Instance
+end
+
+local function CreateCorner(Parent: Instance, Radius: number): ()
+	Create("UICorner", {
+		CornerRadius = UDim.new(0, Radius),
+		Parent = Parent,
+	})
+end
+
+local function IsScriptObject(Instance: Instance): boolean
+	return Instance:IsA("LocalScript") or Instance:IsA("ModuleScript")
+end
+
+local function IsCoreInstance(Instance: Instance): boolean
+	local Current: Instance? = Instance
+	while Current and Current ~= game do
+		local Parent = Current.Parent
+		if not Parent then
+			break
+		end
+		if Parent.ClassName == "CoreGui" or Parent.ClassName == "CorePackages" or Parent.ClassName == "LocalSaves" then
+			return true
+		end
+		Current = Parent
+	end
+	return false
+end
+
+local function GetInstancePath(Instance: Instance): string
+	local Parts: { string } = {}
+	local Current: Instance? = Instance
+	while Current and Current ~= game do
+		local Name = Current.Name
+		if Name:match("^[%a_][%w_]*$") then
+			table.insert(Parts, 1, "." .. Name)
+		else
+			table.insert(Parts, 1, string.format("[%q]", Name))
+		end
+		Current = Current.Parent
+	end
+	return "game" .. table.concat(Parts)
+end
+
+local function ReadSource(ScriptObject: LocalScript | ModuleScript): string
+	if RunService:IsStudio() then
+		local Success, Source = pcall(function(): string
+			return ScriptObject.Source
+		end)
+		if Success and type(Source) == "string" and Source ~= "" then
+			return Source
+		end
+	end
+
+	local Decompile = ExternalFunction("decompile")
+	if Decompile then
+		local Success, Source = pcall(Decompile, ScriptObject)
+		if Success and type(Source) == "string" then
+			return Source
+		end
+	end
+	return ""
+end
+
+local function StripComments(Source: string): string
+	local Output: { string } = {}
+	local Length = #Source
+	local Index = 1
+	local Quote: string? = nil
+
+	while Index <= Length do
+		local Character = Source:sub(Index, Index)
+		if Quote then
+			table.insert(Output, Character)
+			if Character == Quote and Source:sub(Index - 1, Index - 1) ~= "\\" then
+				Quote = nil
+			end
+			Index += 1
+		elseif Character == "\"" or Character == "'" then
+			Quote = Character
+			table.insert(Output, Character)
+			Index += 1
+		elseif Source:sub(Index, Index + 1) == "--" then
+			local LongComment = Source:sub(Index, Index + 3) == "--[["
+			local Closing = LongComment and Source:find("]]", Index + 4, true) or Source:find("\n", Index + 2, true)
+			local Stop = Closing and (LongComment and Closing + 1 or Closing - 1) or Length
+			local Removed = Source:sub(Index, Stop)
+			table.insert(Output, (Removed:gsub("[^\r\n]", " ")))
+			Index = Stop + 1
+		else
+			table.insert(Output, Character)
+			Index += 1
+		end
+	end
+
+	return table.concat(Output)
+end
+
+local function IsEscaped(Value: string, Position: number): boolean
+	local SlashCount = 0
+	for Index = Position - 1, 1, -1 do
+		if Value:sub(Index, Index) ~= "\\" then
+			break
+		end
+		SlashCount += 1
+	end
+	return SlashCount % 2 == 1
+end
+
+local function FindClosingParenthesis(Source: string, OpenIndex: number): number?
+	local Depth = 0
+	local Quote: string? = nil
+	for Index = OpenIndex, #Source do
+		local Character = Source:sub(Index, Index)
+		if Quote then
+			if Character == Quote and not IsEscaped(Source, Index) then
+				Quote = nil
+			end
+		elseif Character == "\"" or Character == "'" then
+			Quote = Character
+		elseif Character == "(" then
+			Depth += 1
+		elseif Character == ")" then
+			Depth -= 1
+			if Depth == 0 then
+				return Index
+			end
+		end
+	end
+	return nil
+end
+
+local function SplitArguments(Value: string): { string }
+	local Arguments: { string } = {}
+	local Start = 1
+	local Parentheses = 0
+	local Braces = 0
+	local Brackets = 0
+	local Quote: string? = nil
+
+	for Index = 1, #Value do
+		local Character = Value:sub(Index, Index)
+		if Quote then
+			if Character == Quote and not IsEscaped(Value, Index) then
+				Quote = nil
+			end
+		elseif Character == "\"" or Character == "'" then
+			Quote = Character
+		elseif Character == "(" then
+			Parentheses += 1
+		elseif Character == ")" then
+			Parentheses -= 1
+		elseif Character == "{" then
+			Braces += 1
+		elseif Character == "}" then
+			Braces -= 1
+		elseif Character == "[" then
+			Brackets += 1
+		elseif Character == "]" then
+			Brackets -= 1
+		elseif Character == "," and Parentheses == 0 and Braces == 0 and Brackets == 0 then
+			local Argument = Trim(Value:sub(Start, Index - 1))
+			if Argument ~= "" then
+				table.insert(Arguments, Argument)
+			end
+			Start = Index + 1
+		end
+	end
+
+	local LastArgument = Trim(Value:sub(Start))
+	if LastArgument ~= "" then
+		table.insert(Arguments, LastArgument)
+	end
+	return Arguments
+end
+
+local function CollectAliases(Source: string, ScriptObject: LocalScript | ModuleScript): StringMap
+	local Aliases: StringMap = { script = GetInstancePath(ScriptObject) }
+	for Line in Source:gmatch("[^\r\n]+") do
+		local Name, Value = Line:match("^%s*local%s+([%a_][%w_]*)%s*=%s*(.-)%s*$")
+		if not Name then
+			Name, Value = Line:match("^%s*([%a_][%w_]*)%s*=%s*(.-)%s*$")
+		end
+		if Name and Value then
+			Value = Trim(Value)
+			if #Value <= 1024 and not Value:find("function", 1, true) and not Value:find(";", 1, true) then
+				Aliases[Name] = Value
+			end
+		end
+	end
+	return Aliases
+end
+
+local function ResolveAlias(Expression: string, Aliases: StringMap): string
+	local Resolved = Trim(Expression)
+	for _ = 1, 5 do
+		local Name = Resolved:match("^([%a_][%w_]*)")
+		local Replacement = Name and Aliases[Name]
+		if not Replacement or Replacement == Name then
+			break
+		end
+		Resolved = Replacement .. Resolved:sub(#Name + 1)
+	end
+	return Resolved
+end
+
+local function FindReceiverStart(Source: string, ColonIndex: number): number
+	local Index = ColonIndex - 1
+	while Index > 0 do
+		local Character = Source:sub(Index, Index)
+		if Character == "\n" or Character == "\r" or Character == ";" or Character == "=" or Character == "," then
+			break
+		end
+		Index -= 1
+	end
+	return Index + 1
+end
+
+local function NormalizeEventPart(Value: string): string
+	Value = Trim(Value)
+	Value = Value:gsub("%s+", " ")
+	Value = Value:gsub("%s*([%,%(%)%{%}%[%]])%s*", "%1")
+	return Value
+end
+
+local function GetEventSignature(Receiver: string, Method: RemoteMethod, Arguments: { string }): string
+	local NormalizedReceiver = NormalizeEventPart(Receiver)
+	local NormalizedArguments = table.create(#Arguments)
+
+	for Index, Argument in Arguments do
+		NormalizedArguments[Index] = NormalizeEventPart(Argument)
+	end
+
+	return NormalizedReceiver .. "|" .. Method .. "|" .. table.concat(NormalizedArguments, ",")
+end
+
+local function ExtractCalls(Source: string, ScriptObject: LocalScript | ModuleScript): { RemoteCall }
+	local Stripped = StripComments(Source)
+	local Aliases = CollectAliases(Stripped, ScriptObject)
+	local Calls: { RemoteCall } = {}
+	local Seen: { [string]: boolean } = {}
+	local Quote: string? = nil
+	local Index = 1
+
+	while Index <= #Stripped do
+		local Character = Stripped:sub(Index, Index)
+
+		if Quote then
+			if Character == Quote and not IsEscaped(Stripped, Index) then
+				Quote = nil
+			end
+			Index += 1
+
+		elseif Character == "\"" or Character == "'" then
+			Quote = Character
+			Index += 1
+
+		elseif Character == ":" then
+			local MatchedMethod: RemoteMethod? = nil
+			local OpenIndex = 0
+
+			for _, Method in RemoteMethods do
+				local MethodStart = Index + 1
+
+				if Stripped:sub(MethodStart, MethodStart + #Method - 1) == Method then
+					local Cursor = MethodStart + #Method
+
+					while Stripped:sub(Cursor, Cursor):match("%s") do
+						Cursor += 1
+					end
+
+					if Stripped:sub(Cursor, Cursor) == "(" then
+						MatchedMethod = Method
+						OpenIndex = Cursor
+						break
+					end
+				end
+			end
+
+			if MatchedMethod then
+				local CloseIndex = FindClosingParenthesis(Stripped, OpenIndex)
+
+				if CloseIndex then
+					local Receiver = Trim(
+						Stripped:sub(
+							FindReceiverStart(Stripped, Index),
+							Index - 1
+						)
+					)
+
+					Receiver = Receiver:gsub("^return%s+", "")
+
+					local Arguments = SplitArguments(
+						Stripped:sub(OpenIndex + 1, CloseIndex - 1)
+					)
+
+					for ArgumentIndex, Argument in Arguments do
+						Arguments[ArgumentIndex] = ResolveAlias(Argument, Aliases)
+					end
+
+					local ResolvedReceiver = ResolveAlias(Receiver, Aliases)
+
+					local Expression = string.format(
+						"%s:%s(%s)",
+						ResolvedReceiver,
+						MatchedMethod,
+						table.concat(Arguments, ", ")
+					)
+
+					local Signature = GetEventSignature(
+						ResolvedReceiver,
+						MatchedMethod,
+						Arguments
+					)
+
+					if Receiver ~= "" and not Seen[Signature] then
+						Seen[Signature] = true
+
+						table.insert(Calls, {
+							expression = Expression,
+							method = MatchedMethod,
+						})
+					end
+
+					Index = CloseIndex + 1
+				else
+					Index += 1
+				end
+			else
+				Index += 1
+			end
+		else
+			Index += 1
+		end
+	end
+
+	return Calls
+end
+
+local function Analyze(ScriptObject: LocalScript | ModuleScript): CacheEntry
+	local Cached = ScriptCache[ScriptObject]
+	if Cached then
+		return Cached
+	end
+	local Source = ReadSource(ScriptObject)
+	local Cache: CacheEntry = {
+		source = Source,
+		calls = Source ~= "" and ExtractCalls(Source, ScriptObject) or {},
+	}
+	ScriptCache[ScriptObject] = Cache
+	return Cache
+end
+
+local function FormatCalls(Calls: { RemoteCall }): string
+	if #Calls == 0 then
+		return EmptyOutput
+	end
+	local Sections = table.create(#Calls)
+	for Index, Call in Calls do
+		Sections[Index] = string.format("pcall(function()\n\t%s\nend)", Call.expression)
+	end
+	return table.concat(Sections, "\n\n")
+end
+
+local function GetDisplayName(Item: ScriptItem, DuplicateIndex: number): string
+	local Suffix = Item.object:IsA("ModuleScript") and " [Module]" or ""
+	if DuplicateIndex > 0 then
+		Suffix ..= string.format(" (%d)", DuplicateIndex + 1)
+	end
+	return Item.object.Name .. Suffix
+end
+
+local function UpdateCanvas(ScrollingFrame: ScrollingFrame, Layout: UIListLayout): ()
+	ScrollingFrame.CanvasSize = UDim2.fromOffset(0, Layout.AbsoluteContentSize.Y + 6)
+end
+
+local function UpdateTextCanvas(ScrollingFrame: ScrollingFrame, TextBox: TextBox): ()
+	local Width = math.max(ScrollingFrame.AbsoluteSize.X - 12, 1)
+	local Size = TextService:GetTextSize(TextBox.Text, TextBox.TextSize, TextBox.Font, Vector2.new(Width, math.huge))
+	TextBox.Size = UDim2.new(TextBox.Size.X.Scale, TextBox.Size.X.Offset, 0, math.max(Size.Y + 12, ScrollingFrame.AbsoluteSize.Y - 6))
+	ScrollingFrame.CanvasSize = UDim2.fromOffset(0, TextBox.Position.Y.Offset + TextBox.Size.Y.Offset + 6)
+end
+
+local function AddLog(Message: string): ()
+	local CurrentUi = Ui
+	if not CurrentUi or Destroyed then
+		return
+	end
+	local Timestamp = os.date("%H:%M:%S")
+	local Existing = CurrentUi.logOutput.Text
+	CurrentUi.logOutput.Text = Existing == "" and string.format("[%s] %s", Timestamp, Message)
+		or string.format("%s\n[%s] %s", Existing, Timestamp, Message)
+	UpdateTextCanvas(CurrentUi.logPanel, CurrentUi.logOutput)
+	CurrentUi.logPanel.CanvasPosition = Vector2.new(0, math.max(CurrentUi.logPanel.CanvasSize.Y.Offset, 0))
+end
+
+local function UpdateIndicators(Item: ScriptItem): ()
+	for _, Child in Item.indicators:GetChildren() do
+		if Child:IsA("Frame") then
+			Child:Destroy()
+		end
+	end
+	local Shown: { [RemoteMethod]: boolean } = {}
+	local IndicatorCount = 0
+	for _, Call in Item.cache.calls do
+		if not Shown[Call.method] then
+			Shown[Call.method] = true
+			IndicatorCount += 1
+			local Indicator = Create("Frame", {
+				BackgroundColor3 = MethodColors[Call.method],
+				BorderSizePixel = 0,
+				Size = UDim2.fromOffset(5, 5),
+			})
+			CreateCorner(Indicator, 3)
+			Indicator.Parent = Item.indicators
+		end
+	end
+	
+	local LabelPosition = 2 + (IndicatorCount * 8) - 3 + 5
+	Item.label.Position = UDim2.fromOffset(LabelPosition, 2)
+	Item.label.Size = UDim2.new(1, -(LabelPosition + 6), 0, 16)
+end
+
+local function UpdateItemVisual(Item: ScriptItem): ()
+	Item.button.BackgroundColor3 = Item.selected and CONFIG.selected or CONFIG.surfaceElevated
+	Item.label.TextColor3 = Item.selected and Color3.new(1, 1, 1) or CONFIG.text
+end
+
+local function ShowSelectedItem(Item: ScriptItem?): ()
+	local CurrentUi = Ui
+	if not CurrentUi then
+		return
+	end
+	SelectedItem = Item
+	for _, Entry in ScriptItems do
+		Entry.selected = Entry == Item
+		UpdateItemVisual(Entry)
+	end
+	CurrentUi.eventOutput.Text = Item and FormatCalls(Item.cache.calls) or NoSelectionOutput
+	UpdateTextCanvas(CurrentUi.eventList, CurrentUi.eventOutput)
+	if Item then
+		UpdateIndicators(Item)
+	end
+end
+
+local function FuzzyScore(Query: string, Target: string): number
+	local QueryIndex = 1
+	local Score = 0
+	local PreviousMatch = 0
+	for Index = 1, #Target do
+		if Target:sub(Index, Index) == Query:sub(QueryIndex, QueryIndex) then
+			Score += Index == PreviousMatch + 1 and 12 or 3
+			PreviousMatch = Index
+			QueryIndex += 1
+			if QueryIndex > #Query then
+				return Score
+			end
+		end
+	end
+	return 0
+end
+
+local function ScoreItem(Item: ScriptItem, Query: string): number
+	if Item.nameLower == Query then
+		return 10_000
+	end
+	if Item.nameLower:sub(1, #Query) == Query then
+		return 8_000
+	end
+	local PlainIndex = Item.nameLower:find(Query, 1, true) or Item.pathLower:find(Query, 1, true)
+	if PlainIndex then
+		return 4_000 - PlainIndex
+	end
+	return FuzzyScore(Query, Item.nameLower)
+end
+
+local function UpdateSearch(): ()
+	local CurrentUi = Ui
+	if not CurrentUi then
+		return
+	end
+	local Query = Trim(CurrentUi.searchBox.Text:lower())
+	for _, Item in ScriptItems do
+		local Score = Query == "" and 1 or ScoreItem(Item, Query)
+		Item.frame.Visible = Score > 0
+		Item.frame.LayoutOrder = Query == "" and Item.order or -Score
+	end
+end
+
+local function UpdateItemOrder(): ()
+	table.sort(ScriptItems, function(Left, Right)
+		if Left.nameLower == Right.nameLower then
+			return Left.discoveryOrder < Right.discoveryOrder
+		end
+
+		return Left.nameLower < Right.nameLower
+	end)
+
+	local DuplicateCounts: { [string]: number } = {}
+
+	for Index, Item in ScriptItems do
+		local NameKey = Item.nameLower
+		local Count = (DuplicateCounts[NameKey] or 0) + 1
+		DuplicateCounts[NameKey] = Count
+
+		Item.order = Index
+		Item.frame.LayoutOrder = Index
+
+		Item.label.Text = GetDisplayName(Item, Count - 1)
+	end
+
+	UpdateSearch()
+end
+
+local function RemoveItem(ScriptObject: LocalScript | ModuleScript): ()
+	local Item = ItemsByObject[ScriptObject]
+	if not Item then
+		return
+	end
+	if SelectedItem == Item then
+		ShowSelectedItem(nil)
+	end
+	DisconnectAll(Item.connections)
+	Item.frame:Destroy()
+	ItemsByObject[ScriptObject] = nil
+	ScriptCache[ScriptObject] = nil
+	for Index, Existing in ScriptItems do
+		if Existing == Item then
+			table.remove(ScriptItems, Index)
+			break
+		end
+	end
+	UpdateItemOrder()
+end
+
+local function GetDuplicateSignature(Cache: CacheEntry): string
+	local Parts = table.create(#Cache.calls)
+
+	for Index, Call in Cache.calls do
+		Parts[Index] = Call.method .. "|" .. Call.expression
+	end
+
+	return table.concat(Parts, "\n")
+end
+
+local function AddItem(ScriptObject: LocalScript | ModuleScript): ()
+	local CurrentUi = Ui
+	if not CurrentUi or IsCoreInstance(ScriptObject) or ItemsByObject[ScriptObject] then
+		return
+	end
+
+	local Cache = Analyze(ScriptObject)
+	if #Cache.calls == 0 then
+		return
+	end
+
+	local Signature = GetDuplicateSignature(Cache)
+	if DuplicateSignatures[Signature] then
+		return
+	end
+
+	DuplicateSignatures[Signature] = true
+
+	OrderCounter += 1
+	local Frame = Create("Frame", {
+		BackgroundTransparency = 1,
+		Size = UDim2.new(1, -6, 0, 22),
+		Parent = CurrentUi.scriptList,
+	})
+	local Button = Create("TextButton", {
+		AutoButtonColor = false,
+		BackgroundColor3 = CONFIG.surfaceElevated,
+		BorderColor3 = CONFIG.border,
+		BorderSizePixel = 1,
+		Position = UDim2.fromOffset(0, 2),
+		Size = UDim2.new(1, 0, 0, 18),
+		Text = "",
+		Parent = Frame,
+	})
+	CreateCorner(Button, 3)
+	local Indicators = Create("Frame", {
+		BackgroundTransparency = 1,
+		Position = UDim2.fromOffset(2, 8),
+		Size = UDim2.fromOffset(35, 6),
+		Parent = Frame,
+	})
+	Create("UIListLayout", {
+		FillDirection = Enum.FillDirection.Horizontal,
+		Padding = UDim.new(0, 3),
+		VerticalAlignment = Enum.VerticalAlignment.Center,
+		Parent = Indicators,
+	})
+	local Label = Create("TextLabel", {
+		BackgroundTransparency = 1,
+		Font = Enum.Font.Gotham,
+		Position = UDim2.fromOffset(42, 2),
+		Size = UDim2.new(1, -48, 0, 16),
+		TextColor3 = CONFIG.text,
+		TextSize = 11,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Text = ScriptObject.Name,
+		Parent = Frame,
+	})
+	local Item: ScriptItem = {
+		object = ScriptObject,
+		cache = Cache,
+		frame = Frame,
+		button = Button,
+		label = Label,
+		indicators = Indicators,
+		connections = {},
+		nameLower = ScriptObject.Name:lower(),
+		pathLower = GetInstancePath(ScriptObject):lower(),
+		order = OrderCounter,
+		discoveryOrder = OrderCounter,
+		selected = false,
+	}
+	ItemsByObject[ScriptObject] = Item
+	table.insert(ScriptItems, Item)
+	UpdateIndicators(Item)
+	Track(Item.connections, Button.MouseButton1Click:Connect(function()
+		if SelectedItem == Item then
+			ShowSelectedItem(nil)
+		else
+			ShowSelectedItem(Item)
+		end
+	end))
+	Track(Item.connections, Button.MouseEnter:Connect(function()
+		Tween(Button, FastTween, { BackgroundColor3 = Item.selected and CONFIG.selectedHover or CONFIG.surfaceHover })
+	end))
+	Track(Item.connections, Button.MouseLeave:Connect(function()
+		Tween(Button, FastTween, { BackgroundColor3 = Item.selected and CONFIG.selected or CONFIG.surfaceElevated })
+	end))
+	UpdateItemOrder()
+end
+
+local function ScanScripts(): { LocalScript | ModuleScript }
+	local Found: { LocalScript | ModuleScript } = {}
+	for _, Instance in game:GetDescendants() do
+		if IsScriptObject(Instance) and not IsCoreInstance(Instance) then
+			table.insert(Found, Instance :: LocalScript | ModuleScript)
+		end
+	end
+	return Found
+end
+
+local function ClearScripts(): ()
+	for _, Item in ScriptItems do
+		DisconnectAll(Item.connections)
+		Item.frame:Destroy()
+	end
+
+	table.clear(ScriptItems)
+	table.clear(ItemsByObject)
+	table.clear(ScriptCache)
+	table.clear(DuplicateSignatures)
+
+	OrderCounter = 0
+	ShowSelectedItem(nil)
+end
+
+local function RefreshScripts(): ()
+	ClearScripts()
+	local Found = ScanScripts()
+	
+	task.spawn(function()
+		for _, ScriptObject in Found do
+			AddItem(ScriptObject)
+		end
+		UpdateItemOrder()
+		AddLog(#ScriptItems > 0 and string.format("Found %d scripts.", #ScriptItems) or "No scripts found.")
+	end)
+end
+
+local function CopyToClipboard(Value: string): boolean
+	local Clipboard = ExternalFunction("setclipboard") or ExternalFunction("toclipboard")
+	if not Clipboard then
+		return false
+	end
+	return pcall(Clipboard, Value)
+end
+
+local function ExecuteOutput(): ()
+	local CurrentUi = Ui
+	if not CurrentUi or not SelectedItem or CurrentUi.eventOutput.Text == EmptyOutput or CurrentUi.eventOutput.Text == NoSelectionOutput then
+		AddLog("Nothing to execute.")
+		return
+	end
+	local Loadstring = ExternalFunction("loadstring")
+	if not Loadstring then
+		AddLog("Loadstring not available.")
+		return
+	end
+	local CompiledOk, CompiledOrError = pcall(Loadstring, CurrentUi.eventOutput.Text)
+	if not CompiledOk or type(CompiledOrError) ~= "function" then
+		AddLog("Compile failed.")
+		return
+	end
+	task.spawn(function()
+		local Success, Message = pcall(CompiledOrError)
+		AddLog(Success and "Executed." or string.format("Failed: %s", tostring(Message)))
+	end)
+end
+
+local function CreatePanel(Parent: Instance, Name: string, Position: UDim2, Size: UDim2): Frame
+	local Panel = Create("Frame", {
+		Parent = Parent,
+		Name = Name,
+		BackgroundColor3 = CONFIG.surface,
+		BorderSizePixel = 1,
+		BorderColor3 = CONFIG.border,
+		Position = Position,
+		Size = Size,
+		ClipsDescendants = true,
+	})
+	CreateCorner(Panel, 4)
+	return Panel
+end
+
+local function CreateText(Parent: Instance, Text: string, Position: UDim2, Size: UDim2, Properties: PropertyMap?): TextLabel
+	local Label = Create("TextLabel", Properties or {})
+	Label.Parent = Parent
+	Label.BackgroundTransparency = 1
+	Label.Position = Position
+	Label.Size = Size
+	Label.Text = Text
+	Label.Font = Enum.Font.Gotham
+	Label.TextColor3 = CONFIG.text
+	Label.TextSize = 11
+	Label.TextXAlignment = Enum.TextXAlignment.Left
+	return Label
+end
+
+local PlayerThumbnail = "rbxasset://textures/ui/GuidelineLight.png"
+pcall(function()
+	PlayerThumbnail = Players:GetUserThumbnailAsync(LocalPlayer.UserId, Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size100x100)
+end)
+
+local function CreateGui(): Ui
+	local Gui = Create("ScreenGui", {
+		ResetOnSpawn = false,
+		DisplayOrder = 999999,
+		Name = CONFIG.windowName,
+	})
+	Gui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+
+	local Window = Create("Frame", {
+		Parent = Gui,
+		BackgroundColor3 = Color3.fromRGB(12, 12, 12),
+		BorderSizePixel = 1,
+		BorderColor3 = CONFIG.border,
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.new(0.5, 0, 0.5, 0),
+		Size = UDim2.new(0, CONFIG.defaultWidth, 0, CONFIG.defaultHeight),
+		ClipsDescendants = true,
+	})
+	CreateCorner(Window, 6)
+
+	local Header = Create("Frame", {
+		Parent = Window,
+		BackgroundColor3 = CONFIG.surfaceElevated,
+		BorderSizePixel = 1,
+		BorderColor3 = CONFIG.border,
+		Size = UDim2.new(1, 0, 0, 52),
+	})
+	CreateCorner(Header, 6)
+
+	local HeaderUnder = Create("Frame", {
+		Parent = Header,
+		BackgroundColor3 = CONFIG.surfaceElevated,
+		BorderSizePixel = 0,
+		Position = UDim2.new(0, 0, 0, 40),
+		Size = UDim2.new(1, 0, 0, 12),
+	})
+
+	local UserAvatar = Create("Frame", {
+		Parent = Header,
+		Position = UDim2.new(0, 8, 0, 6),
+		Size = UDim2.new(0, 40, 0, 40),
+		BackgroundColor3 = Color3.fromRGB(15, 15, 20),
+		BorderColor3 = Color3.fromRGB(0, 150, 255),
+		BorderSizePixel = 1,
+	})
+	CreateCorner(UserAvatar, 20)
+
+	local AvatarImage = Create("ImageLabel", {
+		Parent = UserAvatar,
+		Size = UDim2.new(1, -4, 1, -4),
+		Position = UDim2.new(0, 2, 0, 2),
+		BackgroundTransparency = 1,
+		Image = PlayerThumbnail,
+	})
+	CreateCorner(AvatarImage, 20)
+
+	local UserInfo = Create("Frame", {
+		Parent = Header,
+		Position = UDim2.new(0, 56, 0, 4),
+		Size = UDim2.new(0, 280, 0, 44),
+		BackgroundTransparency = 1,
+	})
+
+	Create("TextLabel", {
+		Parent = UserInfo,
+		Size = UDim2.new(1, 0, 0, 13),
+		Position = UDim2.new(0, 0, 0, 0),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.Gotham,
+		Text = LocalPlayer.DisplayName,
+		TextColor3 = Color3.fromRGB(255, 255, 255),
+		TextSize = 12,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	})
+
+	Create("TextLabel", {
+		Parent = UserInfo,
+		Size = UDim2.new(1, 0, 0, 11),
+		Position = UDim2.new(0, 0, 0, 12),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.Gotham,
+		Text = "@" .. LocalPlayer.Name,
+		TextColor3 = Color3.fromRGB(150, 150, 150),
+		TextSize = 9,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	})
+
+	Create("TextLabel", {
+		Parent = UserInfo,
+		Size = UDim2.new(1, 0, 0, 10),
+		Position = UDim2.new(0, 0, 0, 22),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.Gotham,
+		Text = "UID: " .. tostring(LocalPlayer.UserId),
+		TextColor3 = Color3.fromRGB(0, 150, 255),
+		TextSize = 8,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	})
+
+	local CloseButton = Create("TextButton", {
+		Parent = Header,
+		BackgroundColor3 = CONFIG.surfaceElevated,
+		BorderSizePixel = 0,
+		Position = UDim2.new(1, -26, 0, 15),
+		Size = UDim2.new(0, 22, 0, 22),
+		Font = Enum.Font.Gotham,
+		Text = "",
+		TextColor3 = Color3.new(0, 0, 0),
+		TextSize = 14,
+	})
+	CreateCorner(CloseButton, 6)
+
+	Create("ImageLabel", {
+		Parent = CloseButton,
+		BackgroundColor3 = Color3.new(1, 1, 1),
+		BackgroundTransparency = 1,
+		Position = UDim2.new(0, 7, 0, 7),
+		Size = UDim2.new(0, 8, 0, 8),
+		Image = "http://www.roblox.com/asset/?id=5597086202",
+		ImageColor3 = Color3.fromRGB(220, 220, 220),
+	})
+
+	local MinimizeButton = Create("TextButton", {
+		Parent = Header,
+		BackgroundColor3 = CONFIG.surfaceElevated,
+		BorderSizePixel = 0,
+		Position = UDim2.new(1, -50, 0, 15),
+		Size = UDim2.new(0, 22, 0, 22),
+		Font = Enum.Font.Gotham,
+		Text = "",
+		TextColor3 = Color3.new(0, 0, 0),
+		TextSize = 14,
+	})
+	CreateCorner(MinimizeButton, 3)
+
+	Create("ImageLabel", {
+		Parent = MinimizeButton,
+		BackgroundColor3 = Color3.new(1, 1, 1),
+		BackgroundTransparency = 1,
+		Position = UDim2.new(0, 7, 0, 7),
+		Size = UDim2.new(0, 8, 0, 8),
+		Image = "http://www.roblox.com/asset/?id=5597105827",
+		ImageColor3 = Color3.fromRGB(220, 220, 220),
+	})
+
+	Create("ImageLabel", {
+		Parent = Header,
+		Size = UDim2.new(0, 600, 0, 120),
+		Position = UDim2.new(1, -400, 0, -30),
+		BackgroundTransparency = 1,
+		ImageTransparency = 0,
+		Image = "rbxassetid://77816636188978",
+		ScaleType = Enum.ScaleType.Fit,
+	})
+
+	local ScriptPanel = CreatePanel(Window, "ScriptsPanel", UDim2.new(0, 6, 0, 58), UDim2.new(0.2, -12, 1, -70))
+
+	CreateText(ScriptPanel, "Scripts", UDim2.new(0, 8, 0, 4), UDim2.new(1, -16, 0, 18), {
+		Font = Enum.Font.Gotham,
+		TextColor3 = CONFIG.text,
+		TextSize = 11,
+	})
+
+	local SearchContainer = Create("Frame", {
+		Parent = ScriptPanel,
+		BackgroundColor3 = Color3.fromRGB(12, 12, 12),
+		BorderSizePixel = 1,
+		BorderColor3 = Color3.fromRGB(35, 35, 35),
+		Position = UDim2.new(0, 6, 0, 24),
+		Size = UDim2.new(1, -12, 0, 20),
+	})
+	CreateCorner(SearchContainer, 4)
+
+	local SearchBox = Create("TextBox", {
+		Parent = SearchContainer,
+		BackgroundTransparency = 1,
+		Position = UDim2.new(0, 6, 0, 0),
+		Size = UDim2.new(1, -12, 1, 0),
+		Font = Enum.Font.Gotham,
+		PlaceholderText = "Search",
+		Text = "",
+		TextColor3 = Color3.fromRGB(220, 220, 220),
+		PlaceholderColor3 = CONFIG.mutedText,
+		TextSize = 10,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		ClearTextOnFocus = false,
+	})
+
+	local ScriptList = Create("ScrollingFrame", {
+		Parent = ScriptPanel,
+		Active = true,
+		BackgroundColor3 = Color3.new(1, 1, 1),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		Position = UDim2.new(0, 4, 0, 48),
+		Size = UDim2.new(1, -8, 1, -54),
+		CanvasSize = UDim2.new(0, 0, 0, 0),
+		ScrollBarThickness = 2,
+		ScrollBarImageColor3 = Color3.fromRGB(60, 60, 60),
+	})
+	
+	local function UpdateScriptListSize()
+		local ParentSize = ScriptPanel.AbsoluteSize
+		ScriptList.CanvasSize = UDim2.fromOffset(0, 0)
+	end
+	Track(UiConnections, ScriptPanel:GetPropertyChangedSignal("AbsoluteSize"):Connect(UpdateScriptListSize))
+
+	local ScriptLayout = Create("UIListLayout", {
+		Parent = ScriptList,
+		HorizontalAlignment = Enum.HorizontalAlignment.Center,
+		SortOrder = Enum.SortOrder.LayoutOrder,
+		Padding = UDim.new(0, 2),
+	})
+
+	local EventPanel = CreatePanel(Window, "EventsPanel", UDim2.new(0.2, 0, 0, 58), UDim2.new(0.35, -12, 1, -70))
+
+	CreateText(EventPanel, "Event Calls", UDim2.new(0, 6, 0, 4), UDim2.new(1, -12, 0, 18), {
+		Font = Enum.Font.Gotham,
+		TextColor3 = CONFIG.text,
+		TextSize = 11,
+	})
+
+	local EventList = Create("ScrollingFrame", {
+		Parent = EventPanel,
+		Active = true,
+		BackgroundColor3 = Color3.fromRGB(10, 10, 10),
+		BorderSizePixel = 1,
+		BorderColor3 = Color3.fromRGB(30, 30, 30),
+		Position = UDim2.new(0, 6, 0, 24),
+		Size = UDim2.new(1, -12, 0, 130),
+		CanvasSize = UDim2.new(0, 0, 0, 0),
+		ScrollBarThickness = 3,
+		ScrollBarImageColor3 = Color3.fromRGB(60, 60, 60),
+	})
+	CreateCorner(EventList, 4)
+
+	local EventOutput = Create("TextBox", {
+		Parent = EventList,
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		ClearTextOnFocus = false,
+		MultiLine = true,
+		Text = NoSelectionOutput,
+		TextColor3 = Color3.fromRGB(160, 160, 160),
+		TextSize = 10,
+		Font = Enum.Font.Gotham,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Top,
+		TextEditable = false,
+		TextWrapped = true,
+		Size = UDim2.new(1, 0, 1, 0),
+	})
+
+	local EventsPadding = Create("UIPadding", {
+		PaddingLeft = UDim.new(0, 8),
+		PaddingRight = UDim.new(0, 8),
+		PaddingTop = UDim.new(0, 8),
+		PaddingBottom = UDim.new(0, 8),
+		Parent = EventOutput,
+	})
+
+	local Actions = Create("Frame", {
+		Parent = EventPanel,
+		BackgroundColor3 = Color3.new(1, 1, 1),
+		BackgroundTransparency = 1,
+		Position = UDim2.new(0, 6, 0, 160),
+		Size = UDim2.new(1, -12, 1, -170),
+		BorderSizePixel = 0,
+	})
+
+	local ParamsGrid = Create("UIGridLayout", {
+		Parent = Actions,
+		HorizontalAlignment = Enum.HorizontalAlignment.Left,
+		VerticalAlignment = Enum.VerticalAlignment.Top,
+		SortOrder = Enum.SortOrder.LayoutOrder,
+		FillDirection = Enum.FillDirection.Horizontal,
+		CellPadding = UDim2.new(0, 4, 0, 4),
+		CellSize = UDim2.new(0, 110, 0, 20),
+	})
+
+	local LogsPanel = CreatePanel(Window, "LogsPanel", UDim2.new(0.55, 0, 0, 58), UDim2.new(0.45, -12, 1, -70))
+
+	CreateText(LogsPanel, "Log Output", UDim2.new(0, 6, 0, 4), UDim2.new(1, -12, 0, 18), {
+		Font = Enum.Font.Gotham,
+		TextColor3 = CONFIG.text,
+		TextSize = 11,
+	})
+
+	local LogPanel = Create("ScrollingFrame", {
+		Parent = LogsPanel,
+		Active = true,
+		BackgroundColor3 = Color3.fromRGB(10, 10, 10),
+		BorderSizePixel = 1,
+		BorderColor3 = Color3.fromRGB(30, 30, 30),
+		Position = UDim2.new(0, 6, 0, 24),
+		Size = UDim2.new(1, -12, 1, -30),
+		CanvasSize = UDim2.new(0, 0, 0, 0),
+		ScrollBarThickness = 3,
+		ScrollBarImageColor3 = Color3.fromRGB(60, 60, 60),
+	})
+	CreateCorner(LogPanel, 4)
+
+	local LogOutput = Create("TextBox", {
+		Parent = LogPanel,
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		ClearTextOnFocus = false,
+		MultiLine = true,
+		Text = "",
+		TextColor3 = Color3.fromRGB(160, 160, 160),
+		TextSize = 9,
+		Font = Enum.Font.Gotham,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Top,
+		TextEditable = false,
+		TextWrapped = true,
+		Size = UDim2.new(1, 0, 1, 0),
+	})
+
+	local LogPadding = Create("UIPadding", {
+		PaddingLeft = UDim.new(0, 6),
+		PaddingRight = UDim.new(0, 6),
+		PaddingTop = UDim.new(0, 6),
+		PaddingBottom = UDim.new(0, 6),
+		Parent = LogOutput,
+	})
+
+	local ResizeHandle = Create("ImageButton", {
+		Parent = Window,
+		Name = "ResizeHandle",
+		BackgroundTransparency = 1,
+		Position = UDim2.new(1, -12, 1, -12),
+		Size = UDim2.new(0, 12, 0, 12),
+		Image = "rbxassetid://3944703564",
+		ImageRectOffset = Vector2.new(844, 684),
+		ImageRectSize = Vector2.new(36, 36),
+		ImageColor3 = Color3.fromRGB(80, 80, 80),
+		ZIndex = 10,
+	})
+
+	local Tooltip = Create("TextLabel", {
+		Parent = EventPanel,
+		BackgroundTransparency = 1,
+		Position = UDim2.new(0, 6, 0, 337),
+		Size = UDim2.new(0, 238, 0, 20),
+		Font = Enum.Font.Gotham,
+		Text = "",
+		TextColor3 = CONFIG.mutedText,
+		TextSize = 9,
+		TextWrapped = true,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Bottom,
+	})
+
+	return {
+		gui = Gui,
+		window = Window,
+		header = Header,
+		body = Window,
+		scriptPanel = ScriptPanel,
+		eventPanel = EventPanel,
+		logPanel = LogPanel,
+		scriptList = ScriptList,
+		eventList = EventList,
+		eventOutput = EventOutput,
+		logOutput = LogOutput,
+		searchBox = SearchBox,
+		actions = Actions,
+		tooltip = Tooltip,
+		resizeHandle = ResizeHandle,
+		minimizeButton = MinimizeButton,
+		closeButton = CloseButton,
+	}
+end
+
+local function CreateActionButton(Parent: Frame, Label: string, Color: Color3, HoverColor: Color3, Tooltip: string, Callback: () -> ()): TextButton
+	local ButtonFrame = Create("Frame", {
+		Name = "FunctionTemplate",
+		Parent = Parent,
+		BackgroundColor3 = Color3.new(1, 1, 1),
+		BackgroundTransparency = 1,
+		Size = UDim2.new(0, 110, 0, 20),
+	})
+
+	local ColorBar = Create("Frame", {
+		Name = "ColorBar",
+		Parent = ButtonFrame,
+		BackgroundColor3 = Color,
+		BorderSizePixel = 0,
+		Position = UDim2.new(0, 2, 0, 2),
+		Size = UDim2.new(0, 3, 0, 16),
+		ZIndex = 3,
+	})
+
+	Create("TextLabel", {
+		Text = Label,
+		Name = "Text",
+		Parent = ButtonFrame,
+		BackgroundColor3 = Color3.new(1, 1, 1),
+		BackgroundTransparency = 1,
+		Position = UDim2.new(0, 8, 0, 2),
+		Size = UDim2.new(0, 98, 0, 16),
+		ZIndex = 2,
+		Font = Enum.Font.Gotham,
+		TextColor3 = CONFIG.text,
+		TextSize = 9,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Center,
+	})
+
+	local ButtonElement = Create("TextButton", {
+		Name = "Button",
+		Parent = ButtonFrame,
+		BackgroundColor3 = CONFIG.surfaceElevated,
+		BackgroundTransparency = 0,
+		BorderColor3 = Color3.fromRGB(45, 45, 45),
+		Position = UDim2.new(0, 0, 0, 2),
+		Size = UDim2.new(0, 110, 0, 16),
+		AutoButtonColor = false,
+		Font = Enum.Font.Gotham,
+		Text = "",
+		TextColor3 = Color3.new(0, 0, 0),
+		TextSize = 14,
+	})
+	CreateCorner(ButtonElement, 3)
+
+	Track(UiConnections, ButtonElement.MouseEnter:Connect(function()
+		Tween(ButtonElement, FastTween, { BackgroundColor3 = CONFIG.surfaceHover })
+		Tween(ColorBar, FastTween, { BackgroundColor3 = HoverColor })
+		local CurrentUi = Ui
+		if CurrentUi then
+			CurrentUi.tooltip.Text = Tooltip
+		end
+	end))
+
+	Track(UiConnections, ButtonElement.MouseLeave:Connect(function()
+		Tween(ButtonElement, FastTween, { BackgroundColor3 = CONFIG.surfaceElevated })
+		Tween(ColorBar, FastTween, { BackgroundColor3 = Color })
+		local CurrentUi = Ui
+		if CurrentUi then
+			CurrentUi.tooltip.Text = ""
+		end
+	end))
+
+	Track(UiConnections, ButtonElement.MouseButton1Click:Connect(Callback))
+
+	return ButtonElement
+end
+
+local function DestroyGui(): ()
+	if Destroyed then
+		return
+	end
+	Destroyed = true
+	DisconnectAll(UiConnections)
+	DisconnectAll(WatchConnections)
+	for _, Item in ScriptItems do
+		DisconnectAll(Item.connections)
+	end
+	for _, ActiveTween in ActiveTweens do
+		ActiveTween:Cancel()
+	end
+	table.clear(ActiveTweens)
+	local CurrentUi = Ui
+	Ui = nil
+	if CurrentUi then
+		CurrentUi.gui:Destroy()
+	end
+end
+
+local function ToggleMinimize(): ()
+	local CurrentUi = Ui
+	if not CurrentUi then
+		return
+	end
+	Minimized = not Minimized
+	if Minimized then
+		WindowSize = Vector2.new(CurrentUi.window.Size.X.Offset, CurrentUi.window.Size.Y.Offset)
+		CurrentUi.scriptPanel.Visible = false
+		CurrentUi.eventPanel.Visible = false
+		CurrentUi.logPanel.Visible = false
+		CurrentUi.resizeHandle.Visible = false
+		Tween(CurrentUi.window, MediumTween, { Size = UDim2.new(0, WindowSize.X, 0, CONFIG.headerHeight) })
+	else
+		Tween(CurrentUi.window, MediumTween, { Size = UDim2.new(0, WindowSize.X, 0, WindowSize.Y) })
+		CurrentUi.scriptPanel.Visible = true
+		CurrentUi.eventPanel.Visible = true
+		CurrentUi.logPanel.Visible = true
+		CurrentUi.resizeHandle.Visible = true
+	end
+end
+
+local function SetupInputHandling(): ()
+	local CurrentUi = Ui
+	if not CurrentUi then
+		return
+	end
+	Track(UiConnections, CurrentUi.header.InputBegan:Connect(function(Input)
+		if Input.UserInputType == Enum.UserInputType.MouseButton1 or Input.UserInputType == Enum.UserInputType.Touch then
+			DragState = {
+				start = Input.Position,
+				position = CurrentUi.window.Position,
+			}
+		end
+	end))
+	Track(UiConnections, CurrentUi.resizeHandle.InputBegan:Connect(function(Input)
+		if not Minimized and (Input.UserInputType == Enum.UserInputType.MouseButton1 or Input.UserInputType == Enum.UserInputType.Touch) then
+			ResizeState = {
+				start = Input.Position,
+				size = CurrentUi.window.Size,
+			}
+		end
+	end))
+	Track(UiConnections, UserInputService.InputChanged:Connect(function(Input)
+		if Input.UserInputType ~= Enum.UserInputType.MouseMovement and Input.UserInputType ~= Enum.UserInputType.Touch then
+			return
+		end
+		if DragState then
+			local Delta = Input.Position - DragState.start
+			CurrentUi.window.Position = UDim2.new(
+				DragState.position.X.Scale,
+				DragState.position.X.Offset + Delta.X,
+				DragState.position.Y.Scale,
+				DragState.position.Y.Offset + Delta.Y
+			)
+		elseif ResizeState then
+			local Delta = Input.Position - ResizeState.start
+			local Width = math.max(CONFIG.minimumWidth, ResizeState.size.X.Offset + Delta.X)
+			local Height = math.max(CONFIG.minimumHeight, ResizeState.size.Y.Offset + Delta.Y)
+			CurrentUi.window.Size = UDim2.fromOffset(Width, Height)
+			WindowSize = Vector2.new(Width, Height)
+		end
+	end))
+	Track(UiConnections, UserInputService.InputEnded:Connect(function(Input)
+		if Input.UserInputType == Enum.UserInputType.MouseButton1 or Input.UserInputType == Enum.UserInputType.Touch then
+			DragState = nil
+			ResizeState = nil
+		end
+	end))
+end
+
+local function WatchScripts(): ()
+	Track(WatchConnections, game.DescendantAdded:Connect(function(Instance)
+		if IsScriptObject(Instance) and not IsCoreInstance(Instance) then
+			AddItem(Instance :: LocalScript | ModuleScript)
+		end
+	end))
+	Track(WatchConnections, game.DescendantRemoving:Connect(function(Instance)
+		if IsScriptObject(Instance) then
+			RemoveItem(Instance :: LocalScript | ModuleScript)
+		end
+	end))
+end
+
+Ui = CreateGui()
+local CurrentUi = Ui
+local ScriptLayout = CurrentUi.scriptList:FindFirstChildOfClass("UIListLayout") :: UIListLayout
+
+Track(UiConnections, CurrentUi.searchBox:GetPropertyChangedSignal("Text"):Connect(UpdateSearch))
+Track(UiConnections, ScriptLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+	UpdateCanvas(CurrentUi.scriptList, ScriptLayout)
+end))
+Track(UiConnections, CurrentUi.eventOutput:GetPropertyChangedSignal("Text"):Connect(function()
+	UpdateTextCanvas(CurrentUi.eventList, CurrentUi.eventOutput)
+end))
+Track(UiConnections, CurrentUi.logOutput:GetPropertyChangedSignal("Text"):Connect(function()
+	UpdateTextCanvas(CurrentUi.logPanel, CurrentUi.logOutput)
+end))
+Track(UiConnections, CurrentUi.closeButton.MouseButton1Click:Connect(DestroyGui))
+Track(UiConnections, CurrentUi.minimizeButton.MouseButton1Click:Connect(ToggleMinimize))
+
+for _, Button in { CurrentUi.closeButton, CurrentUi.minimizeButton } do
+	Track(UiConnections, Button.MouseEnter:Connect(function()
+		Tween(Button, FastTween, { BackgroundColor3 = CONFIG.surfaceHover })
+	end))
+	Track(UiConnections, Button.MouseLeave:Connect(function()
+		Tween(Button, FastTween, { BackgroundColor3 = CONFIG.surfaceElevated })
+	end))
+end
+
+CreateActionButton(CurrentUi.actions, "Copy", CONFIG.buttonCopy, CONFIG.buttonCopyHover, "Copy the extracted event calls to clipboard.", function()
+	if not SelectedItem or CurrentUi.eventOutput.Text == "" or CurrentUi.eventOutput.Text == NoSelectionOutput then
+		AddLog("No script selected.")
+		return
+	end
+	if CopyToClipboard(CurrentUi.eventOutput.Text) then
+		AddLog("Copied to clipboard.")
+	else
+		AddLog("Clipboard not available.")
+	end
+end)
+
+CreateActionButton(CurrentUi.actions, "Clear", CONFIG.buttonClear, CONFIG.buttonClearHover, "Delete all scripts and reset the analyzer.", function()
+	ClearScripts()
+	CurrentUi.eventOutput.Text = NoSelectionOutput
+	CurrentUi.eventList.CanvasSize = UDim2.fromOffset(0, 0)
+	CurrentUi.searchBox.Text = ""
+	AddLog("Cleared.")
+end)
+
+CreateActionButton(CurrentUi.actions, "Refresh", CONFIG.buttonRefresh, CONFIG.buttonRefreshHover, "Scan the game and find all scripts.", function()
+	RefreshScripts()
+end)
+
+CreateActionButton(CurrentUi.actions, "Execute", CONFIG.buttonExecute, CONFIG.buttonExecuteHover, "Run the extracted event calls immediately.", function()
+	ExecuteOutput()
+end)
+
+CreateActionButton(CurrentUi.actions, "Edit", CONFIG.buttonEdit, CONFIG.buttonEditHover, "Start editing event calls in write mode.", function()
+	Editing = not Editing
+	if Editing then
+		CurrentUi.eventOutput.TextEditable = true
+		CurrentUi.eventOutput.TextColor3 = Color3.new(1, 1, 1)
+		AddLog("Edit mode on.")
+	else
+		CurrentUi.eventOutput.TextEditable = false
+		CurrentUi.eventOutput.TextColor3 = Color3.fromRGB(160, 160, 160)
+		AddLog("Edit mode off.")
+	end
+end)
+
+CreateActionButton(CurrentUi.actions, "Get Script", CONFIG.buttonGetScript, CONFIG.buttonGetScriptHover, "Copy the entire decompiled script source to clipboard.", function()
+	if not SelectedItem or not SelectedItem.cache.source or SelectedItem.cache.source == "" then
+		AddLog("No script selected.")
+		return
+	end
+	if CopyToClipboard(SelectedItem.cache.source) then
+		AddLog("Source copied.")
+	else
+		AddLog("Clipboard not available.")
+	end
+end)
+
+SetupInputHandling()
+RefreshScripts()
+WatchScripts()
+AddLog("Ready.")
